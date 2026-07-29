@@ -791,9 +791,18 @@ async function loadLiveData(){
       for(let i=0;i<bin.length;i++)u8[i]=bin.charCodeAt(i);
     } else {
       setStatus('📥 공개 URL로 XLSX 다운로드 중...','loading');
-      const resp=await fetch(SHEETS_URL);
-      if(!resp.ok)throw new Error(`다운로드 실패 (HTTP ${resp.status})`);
-      buf=await resp.arrayBuffer();
+      try{
+        const resp=await fetch(SHEETS_URL);
+        if(!resp.ok)throw new Error(`HTTP ${resp.status}`);
+        buf=await resp.arrayBuffer();
+      }catch(e){
+        // CORS 차단 시 프록시 경유 재시도 (GitHub Pages 등 외부 호스팅 환경)
+        setStatus('📥 CORS 프록시로 재시도 중...','loading');
+        const proxyUrl=`https://corsproxy.io/?${encodeURIComponent(SHEETS_URL)}`;
+        const resp2=await fetch(proxyUrl);
+        if(!resp2.ok)throw new Error(`다운로드 실패 (HTTP ${resp2.status})`);
+        buf=await resp2.arrayBuffer();
+      }
     }
 
     setStatus('🔍 시트 파싱 중...','loading');

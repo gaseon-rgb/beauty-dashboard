@@ -208,7 +208,7 @@ table.mkt-table td:first-child,table.mkt-table td:nth-child(2),table.mkt-table t
 const FILE_ID   = '1j2rdXxWatrHc304KGRo0D7d9c5g-l_xV89j3dj21he0';
 const MCP_TOOL  = 'mcp__2110a03a-e860-4070-bf99-4b317c2382ae__download_file_content';
 const SHEETS_URL= `https://docs.google.com/spreadsheets/d/${FILE_ID}/export?format=xlsx`;
-const ANNUAL_TARGET_DEFAULT = 2270000000; // 22.7억 (구글시트 파싱 실패 시 폴백)
+const ANNUAL_TARGET_DEFAULT = 3000000000; // 30억 (구글시트 파싱 실패 시 폴백)
 
 const EV = {
   sale:   { fill:'rgba(233,69,96,0.85)',  stroke:'#e94560', label:'올영세일' },
@@ -778,25 +778,34 @@ async function loadLiveData(){
 
   try{
     let buf;
-    // Cowork 환경(MCP 사용 가능)이면 MCP, 아니면 공개 URL fetch
-    const hasMcp=await waitFor(()=>window.cowork?.callMcpTool!=null,3000).then(()=>true).catch(()=>false);
-    if(hasMcp){
-      setStatus('📥 MCP로 XLSX 다운로드 중...','loading');
-      const r=await window.cowork.callMcpTool(MCP_TOOL,{fileId:FILE_ID,exportMimeType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
-      const payload=r.structuredContent??JSON.parse(r.content[0].text);
-      if(!payload?.content)throw new Error('MCP 응답 오류');
-      const bin=atob(payload.content);
-      buf=new ArrayBuffer(bin.length);
-      const u8=new Uint8Array(buf);
-      for(let i=0;i<bin.length;i++)u8[i]=bin.charCodeAt(i);
-    } else {
+
+    // 1단계: Cowork MCP 직접 시도 (waitFor 없이 즉시 체크 + try/catch)
+    let mcpOk=false;
+    try{
+      if(typeof window.cowork?.callMcpTool==='function'){
+        setStatus('📥 Google Drive MCP로 XLSX 로드 중...','loading');
+        const r=await window.cowork.callMcpTool(MCP_TOOL,{fileId:FILE_ID,exportMimeType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+        if(r?.isError)throw new Error('MCP 오류: '+(r.content?.[0]?.text||'unknown'));
+        const payload=r?.structuredContent??JSON.parse(r?.content?.[0]?.text||'null');
+        if(!payload?.content)throw new Error('MCP 응답에 content 없음');
+        const bin=atob(payload.content);
+        buf=new ArrayBuffer(bin.length);
+        const u8=new Uint8Array(buf);
+        for(let i=0;i<bin.length;i++)u8[i]=bin.charCodeAt(i);
+        mcpOk=true;
+      }
+    }catch(mcpErr){
+      console.warn('[Dashboard] MCP 로드 실패, 공개 URL 전환:',mcpErr?.message||mcpErr);
+    }
+
+    // 2단계: 공개 URL → CORS 프록시 순서로 폴백
+    if(!mcpOk){
       setStatus('📥 공개 URL로 XLSX 다운로드 중...','loading');
       try{
         const resp=await fetch(SHEETS_URL);
         if(!resp.ok)throw new Error(`HTTP ${resp.status}`);
         buf=await resp.arrayBuffer();
       }catch(e){
-        // CORS 차단 시 프록시 경유 재시도 (GitHub Pages 등 외부 호스팅 환경)
         setStatus('📥 CORS 프록시로 재시도 중...','loading');
         const proxyUrl=`https://corsproxy.io/?${encodeURIComponent(SHEETS_URL)}`;
         const resp2=await fetch(proxyUrl);
@@ -938,7 +947,7 @@ function renderDailyChart(monthKey){
   renderWeeklyBreakdown(monthKey);
 }
 
-// ── 주차별 매출 분석
+// ── 주차별 매출 분석 (월~일 기준 ISO 주차, 인접 월 경계 데이터 포함)
 function renderWeeklyBreakdown(monthKey){
   const el=document.getElementById('weeklyBreakdown');
   if(!el)return;
@@ -946,53 +955,131 @@ function renderWeeklyBreakdown(monthKey){
   if(!d||!d.daily?.length){el.innerHTML='';return;}
 
   const monthNum=+monthKey.match(/(\d+)월/)[1];
+  const yrMatch=monthKey.match(/(\d{2})년/);
+  const year=yrMatch?2000+(+yrMatch[1]):new Date().getFullYear();
 
-  // 해당 월 데이터만 주차별 그룹화 (1~7일=1주, 8~14=2주, ...)
-  const byWeek={};
+  // 날짜가 속한 주의 월요일 반환
+  function getMondayOf(date){
+    const dt=new Date(date);
+    const dow=dt.getDay();
+    dt.setDate(dt.getDate()-(dow===0?6:dow-1));
+    dt.setHours(0,0,0,0);
+    return dt;
+  }
+  // M/D 포맷
+  function fmtMD(date){ return `${date.getMonth()+1}/${date.getDate()}`; }
+  // 인접 월 ALL_DATA 키 생성
+  function adjKey(y,m){
+    if(m<1){m+=12;y--;} if(m>12){m-=12;y++;}
+    return `${String(y).slice(-2)}년 ${m}월`;
+  }
+  // 인접 월의 연도 계산
+  function adjYear(offset){
+    const m=monthNum+offset;
+    return m<1?year-1:m>12?year+1:year;
+  }
+  function adjMonth(offset){
+    const m=monthNum+offset;
+    return m<1?m+12:m>12?m-12:m;
+  }
+
+  // 현재 월 경계 날짜
+  const firstDay=new Date(year,monthNum-1,1);
+  const lastDay=new Date(year,monthNum,0);
+  const firstMonday=getMondayOf(firstDay);
+  const lastWeekMonday=getMondayOf(lastDay);
+  const lastSunday=new Date(lastWeekMonday.getTime()+6*86400000);
+
+  // 전체 집계 대상 항목 모으기
+  const allEntries=[];
+
+  // ① 이전 월 데이터 (첫 주 월~일 중 이전 월에 속한 날)
+  if(firstMonday<firstDay){
+    const pm=adjMonth(-1), py=adjYear(-1);
+    const prevD=ALL_DATA[adjKey(py,pm)];
+    if(prevD?.daily?.length){
+      for(const entry of prevD.daily){
+        const parts=entry.d.split('/');
+        if(+parts[0]!==pm)continue;
+        const day=+parts[1];
+        const date=new Date(py,pm-1,day);
+        if(getMondayOf(date).getTime()===firstMonday.getTime())
+          allEntries.push({date,mo:pm,day,sales:entry.s,label:entry.d});
+      }
+    }
+  }
+
+  // ② 현재 월 데이터
   for(const entry of d.daily){
     const parts=entry.d.split('/');
     if(+parts[0]!==monthNum)continue;
     const day=+parts[1];
-    const wk=Math.ceil(day/7);
-    if(!byWeek[wk])byWeek[wk]=[];
-    byWeek[wk].push({day,sales:entry.s});
+    allEntries.push({date:new Date(year,monthNum-1,day),mo:monthNum,day,sales:entry.s,label:entry.d});
   }
 
-  const weeks=Object.keys(byWeek).map(Number).sort((a,b)=>a-b);
-  if(!weeks.length){el.innerHTML='';return;}
+  // ③ 다음 월 데이터 (마지막 주 월~일 중 다음 월에 속한 날)
+  if(lastSunday>lastDay){
+    const nm=adjMonth(+1), ny=adjYear(+1);
+    const nextD=ALL_DATA[adjKey(ny,nm)];
+    if(nextD?.daily?.length){
+      for(const entry of nextD.daily){
+        const parts=entry.d.split('/');
+        if(+parts[0]!==nm)continue;
+        const day=+parts[1];
+        const date=new Date(ny,nm-1,day);
+        if(getMondayOf(date).getTime()===lastWeekMonday.getTime())
+          allEntries.push({date,mo:nm,day,sales:entry.s,label:entry.d});
+      }
+    }
+  }
+
+  // ISO 주차로 그룹화
+  const byWeek={};
+  for(const entry of allEntries){
+    const monday=getMondayOf(entry.date);
+    const key=monday.getTime();
+    if(!byWeek[key]){
+      const sunday=new Date(monday.getTime()+6*86400000);
+      byWeek[key]={monday,sunday,entries:[]};
+    }
+    byWeek[key].entries.push(entry);
+  }
+
+  const sortedKeys=Object.keys(byWeek).map(Number).sort((a,b)=>a-b);
+  if(!sortedKeys.length){el.innerHTML='';return;}
 
   let html=`<div style="font-size:12px;font-weight:700;color:#374151;margin-bottom:8px;padding-top:4px;border-top:1px solid #f3f4f6">📅 주차별 매출 증감</div>`;
 
-  weeks.forEach((wk,i)=>{
-    const entries=byWeek[wk];
+  sortedKeys.forEach((key,i)=>{
+    const wkData=byWeek[key];
+    const entries=wkData.entries.sort((a,b)=>a.date-b.date);
+    const wkNum=i+1;
     const total=entries.reduce((a,e)=>a+e.sales,0);
     const avg=Math.round(total/entries.length);
-    const days=entries.map(e=>e.day).sort((a,b)=>a-b);
-    const s=String(days[0]).padStart(2,'0');
-    const e=String(days[days.length-1]).padStart(2,'0');
+    const rangeLabel=`${fmtMD(wkData.monday)}~${fmtMD(wkData.sunday)}`;
+    const dayCount=entries.length;
+    const partialNote=dayCount<7?` <span style="font-size:10px;color:#9ca3af">(${dayCount}일)</span>`:'';
 
     let wowHtml='';
     if(i>0){
-      const prevTotal=byWeek[weeks[i-1]].reduce((a,e)=>a+e.sales,0);
-      const chg=prevTotal>0?Math.round((total-prevTotal)/prevTotal*100):0;
+      const prevEntries=byWeek[sortedKeys[i-1]].entries;
+      const prevAvg=Math.round(prevEntries.reduce((a,e)=>a+e.sales,0)/prevEntries.length);
+      const chg=prevAvg>0?Math.round((avg-prevAvg)/prevAvg*100):0;
       const isPos=chg>0,isFlat=chg===0;
       const cls=isFlat?'flat':isPos?'pos':'neg';
       const arrow=isFlat?'─':isPos?'▲':'▼';
       wowHtml=`<span class="weekly-sep">|</span><span class="weekly-wow ${cls}">${arrow} 전주 대비 ${isPos?'+':''}${chg}%</span>`;
     }
 
-    // 날씨 이모지 행 (해당 주 날짜 중 WEATHER_DATA 있는 것만)
-    const sortedEntries=[...entries].sort((en1,en2)=>en1.day-en2.day);
-    const weatherHtml=sortedEntries.map(en=>{
-      const key=`${monthNum}/${en.day}`;
-      const w=WEATHER_DATA[key];
-      return w
-        ?`<span class="weather-day" title="${w.text}">${monthNum}/${en.day} ${w.emoji}</span>`
-        :'';
+    // 날씨 이모지 (WEATHER_DATA 키는 "M/D" 형식, mo+day로 직접 조합)
+    const weatherHtml=entries.map(en=>{
+      const wkey=`${en.mo}/${en.day}`;
+      const w=WEATHER_DATA[wkey];
+      return w?`<span class="weather-day" title="${w.text}">${wkey} ${w.emoji}</span>`:'';
     }).join('');
 
     html+=`<div class="weekly-card">
-      <div class="weekly-card-header">${monthNum}월 ${wk}주차 (${monthNum}/${s}~${monthNum}/${e})</div>
+      <div class="weekly-card-header">${monthNum}월 ${wkNum}주차 (${rangeLabel})${partialNote}</div>
       <div class="weekly-card-body">
         <span class="weekly-total">${fmt(total)}</span>
         <span class="weekly-avg">일 평균: ${fmt(avg)}</span>
